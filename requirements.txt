@@ -1,0 +1,10 @@
+ultralytics
+opencv-python
+streamlit
+matplotlib
+pandas
+sqlalchemy
+protobuf
+numpy
+ffmpeg
+plotly
