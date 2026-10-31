@@ -1,79 +1,85 @@
-import streamlit as st
-import pandas as pd
 import os
-st.set_page_config(page_title="Traffic Analysis", layout="wide")
-st.markdown("""
-    <h1 style='text-align: center; color: #1f77b4;'>
-        🚗 Traffic Analysis Dashboard
-    </h1>
-    """, unsafe_allow_html=True)
-st.markdown("---")
-video_path = "outputs/annotated_web.mp4"
-csv_path = "outputs/detections.csv"
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.header("📹 Annotated Video")
-    
-    if os.path.exists(video_path):
+import tempfile
+
+import pandas as pd
+import streamlit as st
+
+from process_video import process
+
+OUT = "outputs"
+VIDEO = os.path.join(OUT, "annotated.mp4")
+DET_CSV = os.path.join(OUT, "detections.csv")
+CROSS_CSV = os.path.join(OUT, "crossings.csv")
+
+st.set_page_config(page_title="Traffic Analysis", page_icon="🚗", layout="wide")
+st.title("🚗 Traffic Analysis Dashboard")
+
+with st.sidebar:
+    st.header("Process a video")
+    upload = st.file_uploader("Video", type=["mp4", "avi", "mov", "mkv"])
+    line = st.slider("Counting line (fraction of height)", 0.1, 0.9, 0.6, 0.05)
+    conf = st.slider("Min confidence", 0.1, 0.9, 0.4, 0.05)
+    if st.button("Run", disabled=upload is None, type="primary"):
+        suffix = os.path.splitext(upload.name)[1]
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(upload.getbuffer())
+        bar = st.progress(0.0, "Processing…")
         try:
-            video_file = open(video_path, 'rb')
-            video_bytes = video_file.read()
-            st.video(video_bytes)
-
-            st.download_button(
-                label="📥 Download Video",
-                data=video_bytes,
-                file_name="annotated_traffic.mp4",
-                mime="video/mp4"
-            )
+            s = process(f.name, VIDEO, line_y_ratio=line, min_conf=conf,
+                        progress=lambda i, n: bar.progress(min(i / n, 1.0) if n else 0.0,
+                                                           f"Frame {i}/{n}"))
+            st.success(f"Done: {s['counted']} vehicles counted in {s['seconds']}s")
         except Exception as e:
-            st.error(f"Error: {e}")
-    else:
-        st.warning(f"Video not found: {video_path}")
-        st.info("Run: `python process_video_WORKING.py --input your_video.mp4`")
-with col2:
-    st.header("📊 Statistics")
-    
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path)
-        st.metric("Total Detections", f"{len(df):,}")
-        st.metric("Unique Vehicles", df['track_id'].nunique())
-        st.markdown("---")
+            st.error(str(e))
+        finally:
+            os.remove(f.name)
 
-        st.subheader("Vehicle Types")
-        vehicle_counts = df['class'].value_counts()
-        for vehicle, count in vehicle_counts.items():
-            st.write(f"**{vehicle}**: {count}")
-        st.markdown("---")
-        st.download_button(
-            "📥 Download CSV",
-            data=df.to_csv(index=False),
-            file_name="detections.csv",
-            mime="text/csv"
-        )
-    else:
-        st.warning(f"CSV not found: {csv_path}")
-if os.path.exists(csv_path):
-    st.markdown("---")
-    st.header("📊 Visual Analysis")
-    df = pd.read_csv(csv_path)
+if not os.path.exists(DET_CSV):
+    st.info("No results yet. Upload a video in the sidebar, or run "
+            "`python process_video.py --input sample_videos/input.mp4`.")
+    st.stop()
 
-    chart_col1, chart_col2 = st.columns(2)
-    with chart_col1:
-        st.subheader("Detections by Vehicle Type")
-        st.bar_chart(df['class'].value_counts())
-    
-    with chart_col2:
-        st.subheader("Detections Over Time")
-        df['time_bin'] = (df['timestamp'] // 10).astype(int) * 10
-        time_data = df.groupby('time_bin')['track_id'].nunique()
-        st.line_chart(time_data)
-else:
-    st.info("👆 No data available. Process a video first to see analysis.")
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: gray; padding: 20px;'>"
-    "Smart Traffic Analysis System | Built with YOLOv8 & Streamlit"
-    "</div>",
-    unsafe_allow_html=True
-)
+det = pd.read_csv(DET_CSV)
+cross = pd.read_csv(CROSS_CSV) if os.path.exists(CROSS_CSV) else pd.DataFrame(
+    columns=["frame", "timestamp", "track_id", "class", "direction"])
+
+m = st.columns(4)
+m[0].metric("Vehicles counted", len(cross))
+m[1].metric("Down / Up", f"{(cross['direction'] == 'down').sum()} / "
+                         f"{(cross['direction'] == 'up').sum()}")
+m[2].metric("Unique vehicles tracked", det["track_id"].nunique())
+m[3].metric("Avg confidence", f"{det['conf'].mean():.2f}" if len(det) else "–")
+
+left, right = st.columns([2, 1])
+with left:
+    if os.path.exists(VIDEO):
+        st.video(VIDEO)
+    else:
+        st.warning(f"Video not found: {VIDEO}")
+with right:
+    st.subheader("Counted by type")
+    if len(cross):
+        st.bar_chart(cross.groupby(["class", "direction"]).size().unstack(fill_value=0))
+    else:
+        st.caption("No line crossings.")
+    st.subheader("Tracked by type")
+    # Each track's most frequent class, so one vehicle counts once.
+    st.bar_chart(det.groupby("track_id")["class"].agg(lambda c: c.mode()[0]).value_counts())
+
+st.subheader("Traffic over time")
+bin_s = st.select_slider("Bin size (s)", [1, 5, 10, 30, 60], value=10)
+flow = det.assign(t=(det["timestamp"] // bin_s * bin_s).astype(int)) \
+          .groupby("t")["track_id"].nunique().rename("vehicles in view")
+st.line_chart(flow)
+
+with st.expander("Raw data"):
+    tab1, tab2 = st.tabs(["Crossings", "Detections"])
+    tab1.dataframe(cross, width="stretch")
+    tab2.dataframe(det, width="stretch")
+
+d = st.columns(3)
+if os.path.exists(VIDEO):
+    with open(VIDEO, "rb") as f:
+        d[0].download_button("📥 Video", f, "annotated_traffic.mp4", "video/mp4")
+d[1].download_button("📥 Crossings CSV", cross.to_csv(index=False), "crossings.csv", "text/csv")
+d[2].download_button("📥 Detections CSV", det.to_csv(index=False), "detections.csv", "text/csv")
