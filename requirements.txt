@@ -1,10 +1,5 @@
-ultralytics
+ultralytics>=8.1
+lap
 opencv-python
-streamlit
-matplotlib
 pandas
-sqlalchemy
-protobuf
-numpy
-ffmpeg
-plotly
+streamlit>=1.45

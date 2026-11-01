@@ -1,195 +1,151 @@
 import argparse
 import os
-import cv2
-import time
-import pandas as pd
+import shutil
 import sqlite3
-from ultralytics import YOLO
-from math import hypot
-class CentroidTracker:
-    def __init__(self, max_distance=50):
-        self.next_id = 1
-        self.objects = {}
-        self.max_distance = max_distance
-        self.counted_ids = set()
+import subprocess
+import time
 
-    def update(self, detections):
-        new_centroids = []
-        boxes = []
-        for (x1, y1, x2, y2) in detections:
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            new_centroids.append((cx, cy))
-            boxes.append((x1, y1, x2, y2))
+import cv2
+import pandas as pd
 
-        if len(self.objects) == 0:
-            result = []
-            for cent, box in zip(new_centroids, boxes):
-                oid = self.next_id
-                self.objects[oid] = cent
-                self.next_id += 1
-                result.append((oid, box))
-            return result
-        object_ids = list(self.objects.keys())
-        object_centroids = list(self.objects.values())
-        matches = {}
-        used_new = set()
-        
-        for i, new_c in enumerate(new_centroids):
-            best_id = None
-            best_dist = self.max_distance + 1
-            for oid, old_c in zip(object_ids, object_centroids):
-                d = hypot(new_c[0] - old_c[0], new_c[1] - old_c[1])
-                if d < best_dist:
-                    best_dist = d
-                    best_id = oid
-            if best_id is not None and best_dist <= self.max_distance:
-                matches[best_id] = (new_c, boxes[i])
-                used_new.add(i)
+VEHICLES = {"car", "truck", "bus", "motorcycle", "bicycle"}
+DET_COLS = ["frame", "timestamp", "track_id", "class", "conf", "x1", "y1", "x2", "y2"]
+CROSS_COLS = ["frame", "timestamp", "track_id", "class", "direction"]
 
-        for oid, (cent, box) in matches.items():
-            self.objects[oid] = cent
 
-        for i, (cent, box) in enumerate(zip(new_centroids, boxes)):
-            if i in used_new:
-                continue
-            oid = self.next_id
-            self.objects[oid] = cent
-            self.next_id += 1
-            matches[oid] = (cent, box)
+def crossing(prev_y, y, line_y):
+    """Direction a centroid moved across the line between two frames, or None."""
+    if prev_y < line_y <= y:
+        return "down"
+    if prev_y >= line_y > y:
+        return "up"
+    return None
 
-        return [(oid, matches[oid][1]) for oid in matches]
-def main(args):
-    os.makedirs("outputs", exist_ok=True)
-    if not os.path.exists(args.input):
-        print(f"ERROR: Video not found: {args.input}")
-        return
-    model = YOLO(args.model)
-    cap = cv2.VideoCapture(args.input)
+
+def to_web_mp4(src, dst):
+    """Re-encode to H.264 so browsers can play it; fall back to the raw file."""
+    if shutil.which("ffmpeg"):
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+             "-vcodec", "libx264", "-pix_fmt", "yuv420p", dst])
+        if r.returncode == 0:
+            os.remove(src)
+            return
+    os.replace(src, dst)
+
+
+def process(input_path, output="outputs/annotated.mp4", model_path="yolov8n.pt",
+            imgsz=640, line_y_ratio=0.6, min_conf=0.4, progress=None):
+    """Detect, track and count vehicles. Returns summary dict.
+
+    progress: optional callback(frame_idx, total_frames).
+    """
+    from ultralytics import YOLO  # slow import; keep `crossing` testable without it
+
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Video not found: {input_path}")
+    out_dir = os.path.dirname(output) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    model = YOLO(model_path)
+    class_ids = [i for i, n in model.names.items() if n in VEHICLES]
+
+    cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print("ERROR: Cannot open video")
-        return  
+        raise RuntimeError(f"Cannot open video: {input_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    print(f"Video: {width}x{height}, {fps:.1f} FPS, {total_frames} frames\n")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
-    tracker = CentroidTracker(max_distance=60)
-    conn = sqlite3.connect('outputs/traffic.db')
-    cur = conn.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS detections (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        frame INTEGER, timestamp REAL, track_id INTEGER,
-        class TEXT, conf REAL,
-        x1 INTEGER, y1 INTEGER, x2 INTEGER, y2 INTEGER
-    )''')
-    conn.commit()
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    line_y = int(h * line_y_ratio)
 
-    csv_rows = []
-    total_counts = 0
+    raw = output + ".raw.mp4"
+    writer = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    detections, crossings = [], []
+    last_y = {}  # track_id -> previous centroid y
+    counted = set()  # count each track once; box jitter at the line would double count
+    counts = {"up": 0, "down": 0}
     frame_idx = 0
-    start_time = time.time()
-    line_y = int(height * args.line_y_ratio)
-    vehicle_classes = ['car', 'truck', 'bus', 'motorcycle', 'bicycle']
-    print("Processing frames...")
-    print("=" * 60)
+    start = time.time()
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        ok, frame = cap.read()
+        if not ok:
             break
-            
         frame_idx += 1
         ts = frame_idx / fps
-        results = model.predict(frame, imgsz=args.imgsz, verbose=False)[0]
-        
-        boxes = []
-        classes = []
-        confs = []
-        for result in results.boxes.data.tolist():
-            x1, y1, x2, y2, confidence, class_id = result
-            class_name = model.names[int(class_id)]
-            
-            if frame_idx <= 3:
-                print(f"Frame {frame_idx}: {class_name} ({confidence:.2f})")
-            
-            if class_name.lower() in vehicle_classes and confidence >= args.min_conf:
-                boxes.append((int(x1), int(y1), int(x2), int(y2)))
-                classes.append(class_name)
-                confs.append(confidence)
 
-        tracked = tracker.update(boxes)
-        for idx, (tid, bbox) in enumerate(tracked):
-            label = classes[idx]
-            conf = confs[idx]
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f'ID:{tid} {label} {conf:.2f}', 
-                       (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+        res = model.track(frame, persist=True, imgsz=imgsz, conf=min_conf,
+                          classes=class_ids, tracker="bytetrack.yaml", verbose=False)[0]
+        b = res.boxes
+        if b.id is not None:
+            for (x1, y1, x2, y2), tid, cls, conf in zip(
+                    b.xyxy.int().tolist(), b.id.int().tolist(),
+                    b.cls.int().tolist(), b.conf.tolist()):
+                label = model.names[cls]
+                detections.append([frame_idx, ts, tid, label, conf, x1, y1, x2, y2])
 
-            cur.execute('''INSERT INTO detections 
-                        (frame, timestamp, track_id, class, conf, x1, y1, x2, y2) 
-                        VALUES (?,?,?,?,?,?,?,?,?)''',
-                       (frame_idx, ts, tid, label, conf, x1, y1, x2, y2))
-            csv_rows.append({
-                'frame': frame_idx, 'timestamp': ts, 'track_id': tid, 
-                'class': label, 'conf': conf, 
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
-            })
-            centroid = tracker.objects.get(tid)
-            if centroid and tid not in tracker.counted_ids:
-                if centroid[1] > line_y:
-                    tracker.counted_ids.add(tid)
-                    total_counts += 1
-        cv2.line(frame, (0, line_y), (width, line_y), (0,0,255), 3)
-        cv2.putText(frame, f'Count: {total_counts}', (10, 40),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,255,255), 3)
-        cv2.putText(frame, f'Frame: {frame_idx}/{total_frames}', (10, 80),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-        out.write(frame)
+                cy = (y1 + y2) // 2
+                d = crossing(last_y[tid], cy, line_y) if tid in last_y and tid not in counted else None
+                last_y[tid] = cy
+                if d:
+                    counted.add(tid)
+                    counts[d] += 1
+                    crossings.append([frame_idx, ts, tid, label, d])
 
-        if frame_idx % 30 == 0:
-            progress = (frame_idx / total_frames * 100) if total_frames > 0 else 0
-            print(f"Progress: {progress:.1f}% | Detections: {len(csv_rows)}")
+                color = (0, 200, 255) if d else (0, 255, 0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"#{tid} {label} {conf:.2f}", (x1, y1 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        if frame_idx % 200 == 0:
-            conn.commit()
+        cv2.line(frame, (0, line_y), (w, line_y), (0, 0, 255), 3)
+        cv2.putText(frame, f"Down: {counts['down']}  Up: {counts['up']}", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 255), 3)
+        writer.write(frame)
 
-    conn.commit()
-    conn.close()
-    out.release()
+        if progress:
+            progress(frame_idx, total)
+        elif frame_idx % 30 == 0:
+            pct = frame_idx / total * 100 if total else 0
+            print(f"{pct:5.1f}%  frame {frame_idx}/{total}  counted {sum(counts.values())}")
+
     cap.release()
+    writer.release()
+    to_web_mp4(raw, output)
 
-    elapsed = time.time() - start_time
-    print("\n" + "=" * 60)
-    if len(csv_rows) > 0:
-        pd.DataFrame(csv_rows).to_csv('outputs/detections.csv', index=False)
-        print(f"✓ SUCCESS!")
-        print(f"  Frames processed: {frame_idx}")
-        print(f"  Detections found: {len(csv_rows)}")
-        print(f"  Vehicles counted: {total_counts}")
-        print(f"  Time: {elapsed:.1f}s ({frame_idx/elapsed:.1f} FPS)")
-    else:
-        print("No detections found!")
-        pd.DataFrame(columns=['frame','timestamp','track_id','class','conf',
-                             'x1','y1','x2','y2']).to_csv('outputs/detections.csv', index=False)
-    
-    print(f"\nOutput files:")
-    print(f"   Video: {args.output}")
-    print(f"   CSV:   outputs/detections.csv")
-    print(f"   DB:    outputs/traffic.db")
-    print("=" * 60)
+    det_df = pd.DataFrame(detections, columns=DET_COLS)
+    cross_df = pd.DataFrame(crossings, columns=CROSS_COLS)
+    det_df.to_csv(os.path.join(out_dir, "detections.csv"), index=False)
+    cross_df.to_csv(os.path.join(out_dir, "crossings.csv"), index=False)
+    # Fresh DB per run so results from different videos don't mix.
+    with sqlite3.connect(os.path.join(out_dir, "traffic.db")) as conn:
+        det_df.to_sql("detections", conn, if_exists="replace", index=False)
+        cross_df.to_sql("crossings", conn, if_exists="replace", index=False)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input', required=True, help='Input video path')
-    parser.add_argument('--output', default='outputs/annotated.mp4', help='Output video')
-    parser.add_argument('--model', default='yolov8n.pt', help='YOLO model')
-    parser.add_argument('--imgsz', type=int, default=640, help='Image size')
-    parser.add_argument('--line_y_ratio', type=float, default=0.75, help='Line position')
-    parser.add_argument('--min_conf', type=float, default=0.5, help='Min confidence')
-    args = parser.parse_args()
-    main(args)
+    elapsed = time.time() - start
+    return {
+        "frames": frame_idx,
+        "detections": len(det_df),
+        "tracked": det_df["track_id"].nunique(),
+        "counted": len(cross_df),
+        **counts,
+        "seconds": round(elapsed, 1),
+        "fps": round(frame_idx / elapsed, 1) if elapsed else 0,
+        "output": output,
+    }
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Vehicle detection, tracking and line counting")
+    p.add_argument("--input", required=True, help="Input video path")
+    p.add_argument("--output", default="outputs/annotated.mp4", help="Annotated output video")
+    p.add_argument("--model", default="yolov8n.pt", help="YOLO weights")
+    p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
+    p.add_argument("--line_y_ratio", type=float, default=0.6,
+                   help="Counting line height as fraction of frame (0=top, 1=bottom)")
+    p.add_argument("--min_conf", type=float, default=0.4, help="Min detection confidence")
+    a = p.parse_args()
+    summary = process(a.input, a.output, a.model, a.imgsz, a.line_y_ratio, a.min_conf)
+    for k, v in summary.items():
+        print(f"{k:>11}: {v}")
