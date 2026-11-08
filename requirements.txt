@@ -1,5 +1,9 @@
+# CPU-only torch: the default CUDA build is several GB and too big for free hosts
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
 ultralytics>=8.1
 lap
-opencv-python
+opencv-python-headless
 pandas
 streamlit>=1.45

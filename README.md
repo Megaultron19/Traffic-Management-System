@@ -48,6 +48,17 @@ python process_video.py --input sample_videos/input.mp4
 | `--line_y_ratio` | `0.6` | Counting line height (0 = top, 1 = bottom) |
 | `--min_conf` | `0.4` | Minimum detection confidence |
 
+## Deploy (free)
+
+**Streamlit Community Cloud**
+1. Go to https://share.streamlit.io and sign in with GitHub.
+2. *Create app* → repo `Megaultron19/Traffic-Management-System`, branch `main`, main file `streamlit_new.py`.
+3. Deploy. `requirements.txt` (CPU-only PyTorch) and `packages.txt` (ffmpeg, libgl1) are picked up automatically.
+
+**Hugging Face Spaces** (more RAM): create a Space with the *Streamlit* SDK and push this repo to it.
+
+Free hosts run on CPU, so processing is slow (a few frames per second). Use short clips.
+
 ## Outputs (`outputs/`)
 
 | File | Contents |
